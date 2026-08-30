@@ -1,0 +1,496 @@
+## Secure Architectural Model Review Web Application
+
+### 1. Core roles
+
+#### Administrator
+Full access to:
+
+- Manage student accounts and roles
+- Upload, edit, and remove architectural learning materials
+- Configure architectural evaluation criteria
+- Review AI analysis results submitted by students
+- View audit logs and security events
+- Revoke sessions and reset passwords
+- Configure retention and privacy settings
+
+#### Student
+Restricted access to:
+
+- View administrator-published materials
+- Upload PDF documents to the current browser session only
+- Capture architectural-model photos through the in-app camera
+- Submit photographs for AI analysis
+- View their own temporary analysis results
+- Delete temporary documents and images
+- Download or export their own analysis before the session ends, if enabled
+
+Student-uploaded PDFs and photographs must not be permanently stored in the application database.
+
+---
+
+## 2. Recommended architecture
+
+```text
+Browser / PWA
+   |
+   | HTTPS
+   v
+Frontend Application
+   |
+   v
+Backend API
+   |-- Authentication and RBAC
+   |-- Material management
+   |-- Temporary file processing
+   |-- Camera-analysis service
+   |-- Audit logging
+   |
+   |-- PostgreSQL
+   |     |-- users
+   |     |-- materials metadata
+   |     |-- criteria
+   |     |-- audit logs
+   |
+   |-- Ephemeral object storage
+   |     |-- temporary PDFs
+   |     |-- temporary photographs
+   |
+   |-- AI analysis provider or private model
+```
+
+A suitable implementation stack would be:
+
+- **Frontend:** React, Next.js, or Vue
+- **Backend:** FastAPI, NestJS, or Express
+- **Database:** PostgreSQL
+- **Authentication:** Secure HTTP-only cookies with short-lived sessions
+- **Temporary storage:** Encrypted memory, temporary filesystem, or object storage with automatic expiry
+- **AI service:** Private inference service or a provider with a strict no-training and no-retention agreement
+- **Deployment:** Docker with separate frontend, API, worker, database, and storage services
+
+The linked GitHub repository can be used as a starting point if it contains an existing frontend, font, or design system. It should be reviewed before integration to verify its license, dependency security, and suitability for production use.
+
+---
+
+## 3. Authentication and role-based access control
+
+### Login requirements
+
+- Email or institutional username
+- Password protected with Argon2id or bcrypt
+- Generic login errors to prevent account enumeration
+- Rate limiting and progressive lockout
+- Optional administrator MFA
+- Secure password reset process
+- Session rotation after login
+- Automatic session expiration
+- Logout invalidation on the server
+- CSRF protection for cookie-based authentication
+- HTTPS-only deployment
+
+### Authorization rules
+
+Authorization must be enforced on the backend, not only in the frontend.
+
+```text
+Administrator
+  /api/admin/users
+  /api/admin/materials
+  /api/admin/criteria
+  /api/admin/audit-logs
+  /api/admin/settings
+
+Student
+  /api/materials
+  /api/session/files
+  /api/session/camera
+  /api/session/analysis
+```
+
+Every protected request should validate:
+
+1. The session is active.
+2. The user identity is valid.
+3. The requested resource belongs to that user or is public to their role.
+4. The user role permits the operation.
+5. The session has not expired or been revoked.
+
+---
+
+## 4. Data model
+
+### Persistent database tables
+
+```sql
+users (
+  id UUID PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT CHECK (role IN ('administrator', 'student')),
+  is_active BOOLEAN DEFAULT TRUE,
+  mfa_enabled BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+
+materials (
+  id UUID PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  storage_key TEXT NOT NULL,
+  uploaded_by UUID REFERENCES users(id),
+  published BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL
+);
+
+architectural_criteria (
+  id UUID PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  weight NUMERIC NOT NULL,
+  active BOOLEAN DEFAULT TRUE,
+  created_by UUID REFERENCES users(id)
+);
+
+audit_logs (
+  id UUID PRIMARY KEY,
+  user_id UUID REFERENCES users(id),
+  action TEXT NOT NULL,
+  resource_type TEXT,
+  resource_id UUID,
+  ip_hash TEXT,
+  user_agent_hash TEXT,
+  created_at TIMESTAMP NOT NULL
+);
+```
+
+### Non-persistent student files
+
+Student-uploaded PDFs and camera images should not be represented as permanent database records. Instead, assign them a short-lived session identifier:
+
+```text
+session_id: random UUID
+file_id: random UUID
+expires_at: current time + 15 minutes
+```
+
+Temporary data should be stored in one of the following ways:
+
+- Browser memory or IndexedDB for local-only previews
+- Encrypted temporary server storage
+- Ephemeral object storage with lifecycle deletion
+- In-memory processing where practical
+
+The database should contain no permanent copy of student PDFs, photographs, raw camera frames, or AI-uploaded images.
+
+---
+
+## 5. Temporary PDF upload flow
+
+1. Student authenticates.
+2. Student selects a PDF.
+3. Frontend validates:
+   - MIME type
+   - File extension
+   - Maximum file size
+   - Maximum page count
+4. Backend performs independent validation.
+5. File is scanned for malware.
+6. PDF is copied to encrypted temporary storage.
+7. The system assigns a short expiration time.
+8. The file is available only to the current student session.
+9. The file is deleted on:
+   - Explicit user deletion
+   - Session expiration
+   - Browser session termination, where feasible
+   - Scheduled cleanup
+   - Server restart, if memory-only storage is used
+
+Security controls:
+
+- Reject executable or polyglot files
+- Do not render PDFs in a privileged browser context
+- Sanitize PDF metadata if it is displayed
+- Prevent path traversal
+- Disable public file URLs
+- Use one-time or session-bound download tokens
+- Apply strict Content Security Policy headers
+
+---
+
+## 6. Secure in-app camera feature
+
+The camera should be accessed only after an explicit student action.
+
+```javascript
+const stream = await navigator.mediaDevices.getUserMedia({
+  video: {
+    facingMode: { ideal: "environment" },
+    width: { ideal: 1920 },
+    height: { ideal: 1080 }
+  },
+  audio: false
+});
+```
+
+### Camera security requirements
+
+- Require HTTPS
+- Request camera permission only from the camera screen
+- Do not activate the camera in the background
+- Do not record audio
+- Show a visible camera-active indicator
+- Provide a clear stop-camera control
+- Stop all tracks when leaving the page
+- Do not save images to a permanent media library
+- Process only the captured frame selected by the student
+- Remove EXIF metadata before analysis
+- Use a strict `Permissions-Policy` header:
+
+```http
+Permissions-Policy: camera=(self), microphone=()
+```
+
+The student should see a preview and explicitly confirm the image before it is sent for analysis.
+
+---
+
+## 7. AI architectural analysis
+
+The AI system should analyze only the selected model photograph and the configured criteria. It should not receive:
+
+- Administrator credentials
+- Administrator private data
+- Unrelated student documents
+- Session cookies
+- Database records
+- Hidden application configuration
+- Other students’ files
+
+### Suggested evaluation criteria
+
+The administrator can configure criteria such as:
+
+1. **Form and massing**
+   - Clarity of overall volume
+   - Relationship between solid and void
+   - Visual hierarchy
+
+2. **Proportion and scale**
+   - Relative dimensions
+   - Human-scale relationship
+   - Balance between components
+
+3. **Composition**
+   - Symmetry or intentional asymmetry
+   - Rhythm and repetition
+   - Focal points
+
+4. **Spatial organization**
+   - Circulation logic
+   - Public/private zoning
+   - Spatial sequencing
+
+5. **Structural expression**
+   - Apparent stability
+   - Structural logic
+   - Relationship between load-bearing and non-load-bearing elements
+
+6. **Material and texture**
+   - Material consistency
+   - Texture contrast
+   - Craft quality visible in the image
+
+7. **Context and sustainability**
+   - Relationship to site assumptions
+   - Environmental response
+   - Passive design indicators
+
+8. **Presentation quality**
+   - Image clarity
+   - Lighting
+   - Visibility of the model
+   - Camera angle adequacy
+
+### AI result format
+
+```json
+{
+  "criteria": [
+    {
+      "name": "Form and massing",
+      "score": 4,
+      "confidence": 0.82,
+      "observations": [
+        "The central volume is clearly dominant.",
+        "The smaller side volumes create a readable hierarchy."
+      ],
+      "recommendations": [
+        "Clarify the transition between the primary and secondary masses."
+      ]
+    }
+  ],
+  "overall_summary": "The model presents a coherent central mass with readable secondary elements.",
+  "limitations": [
+    "Only one camera angle was analyzed.",
+    "Structural performance cannot be verified from the image alone."
+  ]
+}
+```
+
+The result should be described as educational feedback, not a definitive professional architectural judgment.
+
+### AI privacy protections
+
+- Use a private inference endpoint where possible.
+- Disable provider training on submitted images.
+- Set zero-retention or shortest-available retention.
+- Encrypt images in transit and at rest.
+- Strip metadata before transmission.
+- Use per-session request identifiers instead of student names.
+- Delete the image immediately after inference.
+- Return only the structured result.
+- Avoid sending raw images to administrator dashboards.
+- Log only non-sensitive metadata such as processing time and status.
+
+---
+
+## 8. Administrator privacy controls
+
+The administrator area should include:
+
+- MFA enrollment and enforcement
+- Active-session list
+- Revoke-all-sessions function
+- Login and failed-login history
+- Audit log filtering
+- Data-retention settings
+- AI-provider configuration
+- Criteria management
+- Material publication controls
+- Account deactivation
+- Security alert notifications
+
+Administrator-specific data must be protected from student access through both route-level and object-level authorization. A student must never be able to infer administrator data through API responses, identifiers, file names, autocomplete endpoints, or error messages.
+
+---
+
+## 9. Recommended API endpoints
+
+```text
+POST   /api/auth/login
+POST   /api/auth/logout
+POST   /api/auth/refresh
+GET    /api/auth/me
+
+GET    /api/materials
+POST   /api/admin/materials
+PATCH  /api/admin/materials/:id
+DELETE /api/admin/materials/:id
+
+POST   /api/session/pdf
+GET    /api/session/pdf/:fileId
+DELETE /api/session/pdf/:fileId
+
+POST   /api/session/camera/analyze
+GET    /api/session/analysis/:analysisId
+DELETE /api/session/analysis/:analysisId
+
+GET    /api/admin/users
+PATCH  /api/admin/users/:id
+POST   /api/admin/users/:id/revoke-sessions
+
+GET    /api/admin/criteria
+POST   /api/admin/criteria
+PATCH  /api/admin/criteria/:id
+DELETE /api/admin/criteria/:id
+
+GET    /api/admin/audit-logs
+```
+
+Example analysis request:
+
+```http
+POST /api/session/camera/analyze
+Content-Type: multipart/form-data
+Authorization: session cookie
+```
+
+Server-side checks:
+
+```text
+- User must have the student role
+- File must be an image
+- Image must be below the size limit
+- Image must be decoded and re-encoded
+- EXIF metadata must be removed
+- Image must be placed in temporary encrypted storage
+- AI request must use a short timeout
+- Raw image must be deleted after processing
+- Result must be scoped to the current session
+```
+
+---
+
+## 10. Security headers
+
+```http
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+Content-Security-Policy: default-src 'self'; img-src 'self' data:; camera 'self'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Permissions-Policy: camera=(self), microphone=()
+Cache-Control: no-store
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+```
+
+Also implement:
+
+- Input validation with allowlists
+- Parameterized database queries
+- CSRF tokens for state-changing cookie requests
+- Server-side rate limits
+- Dependency vulnerability scanning
+- Secret management through environment or vault services
+- Encrypted backups
+- Regular penetration testing
+- Structured security logging without sensitive payloads
+
+---
+
+## 11. Suggested interface
+
+### Student dashboard
+
+- Materials
+- Temporary PDF workspace
+- Camera analysis
+- Current-session results
+- Privacy information
+- Logout
+
+### Administrator dashboard
+
+- Overview
+- Students
+- Materials
+- Evaluation criteria
+- AI configuration
+- Security and audit logs
+- Session management
+- Privacy and retention settings
+
+The user interface should clearly label temporary content:
+
+> “Files in this workspace are available only during the current session and are automatically deleted when the session expires.”
+
+---
+
+## 12. Critical privacy guarantee
+
+The system should enforce the following invariant:
+
+> No student-uploaded PDF, camera photograph, raw image, or AI payload is written to a permanent database record or retained beyond the configured temporary-processing period.
+
+For stronger guarantees, use in-memory processing and a private AI service. If temporary object storage is required, configure server-side encryption, session-scoped access, automatic deletion rules, and a cleanup worker that verifies deletion failures.
